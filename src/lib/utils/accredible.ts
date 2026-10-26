@@ -2,17 +2,36 @@ import type { Alignment, BadgeClassCTDLExtended } from '$lib/utils/badges.js';
 
 // Accredible Options
 //
-// Auth header format and the Groups endpoint path/pagination params below are
-// taken directly from Accredible's own export script
-// (github.com/accredible/accredible-achievement-ob3-export, accredible_ob3_export.py):
-//   request.add_header("Authorization", f"Token token={self.api_key}")
-//   self._get("/v1/issuer/all_groups", { page, page_size })
+// Auth header, endpoints and response shapes below are confirmed against
+// Accredible's official OpenAPI spec (github.com/accredible/api-documentation,
+// openapi.json). Confirmed:
+//   - Auth: `Authorization: Token token=<api_key>`
+//   - Server domains match accredibleRegions below (US / EU / Sandbox).
+//   - GET /v1/issuer/all_groups -> { groups: [...], meta: { current_page,
+//     next_page, total_pages, total_count } }. Envelope key is `groups`;
+//     paginate via meta.next_page (null = last page).
+//   - Group design ids are `badge_design_id`, `primary_design_id`, `design_id`,
+//     `certificate_design_id` (see badgeDesignIdForGroup) -- all confirmed.
 //
-// The exact JSON envelope key for the groups list, and any endpoint for
-// fetching a badge design/image, were NOT confirmed against Accredible's API
-// reference (docs.accredible.com was not reachable while building this) --
-// see the TODOs below. Confirm both with Accredible before relying on this
-// in production.
+// TWO BEHAVIORAL GAPS the spec reveals (engineering: address before prod):
+//   1. The spec's all_groups EXAMPLE omits `earning_criteria`/`achievement_type`,
+//      but live accounts return them on the list (verified against a real
+//      account). `skills[]` and `skill_framework`, however, come back ONLY from
+//      the single-group GET /v1/issuer/groups/{group_id} (envelope key `group`)
+//      and are a pay-gated feature most badges lack -- so fetchAccredibleGroups()
+//      backfills them via a per-group GET only when opted in
+//      (PUBLIC_ACCREDIBLE_FETCH_GROUP_SKILLS), off by default.
+//   2. `learning_outcomes` on a group is an array of BARE STRINGS (no URL) when
+//      present, and null otherwise -- so alignments built from it always lack
+//      targetUrl and are always dropped by the importer (this is the real cause
+//      of the ~81% drop noted below). The resolvable skills are in the group's
+//      `skills[]` (each has `url`, `name`, `identifier`, `breadcrumbs`) plus
+//      `skill_framework` { taxonomy, provider, attribution } -- map THOSE to
+//      Alignment.targetUrl/targetName/targetFramework instead.
+// Badge image: there is no image field on the group payload, and the design GET
+// response is undocumented (no `rasterized_content_url` in the spec). The only
+// documented image source is POST /v1/designs/{design_id}/preview -> { link }
+// (name-merged render). Treat the preview `link` as the primary image URL.
 
 export type AccredibleEnvKey = 'us' | 'eu' | 'sandbox';
 
@@ -63,6 +82,27 @@ export interface AccredibleLearningOutcome {
 	targetCode?: string;
 }
 
+// A resolved, framework-matched skill as returned on the SINGLE-group GET
+// (/v1/issuer/groups/{id}) under `skills[]`. Unlike `learning_outcomes` (bare
+// strings), each skill carries a public `url` -- the targetUrl Badge Publisher's
+// importer requires. Confirmed against openapi.json (e.g. O*NET skills).
+export interface AccredibleSkill {
+	id?: number | string;
+	name?: string;
+	identifier?: string; // framework code, e.g. "2.A.1.b"
+	description?: string;
+	url?: string; // public framework URL, e.g. https://www.onetonline.org/...
+}
+
+// The skill framework a group's `skills[]` are drawn from, returned alongside
+// them on the single-group GET. Used for Alignment.targetFramework.
+export interface AccredibleSkillFramework {
+	id?: number | string;
+	name?: string; // e.g. "O*NET Skills"
+	taxonomy?: string; // e.g. "ONET"
+	provider?: string;
+}
+
 // A single earning-criterion entry as returned by Accredible. Sandbox groups
 // return `earning_criteria` as an array of these objects (each `text` is an
 // HTML fragment), NOT as a plain string. Confirmed against a live sandbox
@@ -99,11 +139,20 @@ export interface AccredibleGroup {
 	// Populated by fetchAccredibleGroups() after resolving the Design, so
 	// extractImageFromGroup() below can pick it up. Not returned by Accredible.
 	image_url?: string;
+	// NOTE: per the official spec, a group's learning_outcomes is an array of
+	// bare strings (no URL) or null -- NOT the richer object below. The richer,
+	// URL-bearing skills come from the single-group GET as `skills[]` +
+	// `skill_framework` (see header). This union stays for forward-compat.
 	learning_outcomes?: Array<string | AccredibleLearningOutcome>;
-	// TODO(confirm with Accredible): if a badge design/image URL is available
-	// directly on the group payload under some other field name (e.g.
-	// `design`, `badge_design`, `image_url`), add it here and in
-	// extractImageFromGroup() below so we can avoid a second API call per badge.
+	// Returned only by the single-group GET (/v1/issuer/groups/{id}), not the
+	// list endpoint. `skills[]` is the source of URL-bearing alignments; the
+	// list's `learning_outcomes` has none. fetchAccredibleGroups() backfills
+	// these via a per-group GET only when opted in (pay-gated; see header).
+	skills?: AccredibleSkill[];
+	skill_framework?: AccredibleSkillFramework;
+	// Confirmed against openapi.json: the group payload carries NO image field,
+	// so a second call is required. There is no `rasterized_content_url` in the
+	// spec; the documented image source is POST /v1/designs/{id}/preview -> {link}.
 }
 
 const stripHtml = (html: string): string => {
@@ -152,17 +201,20 @@ const extractImageFromGroup = (g: AccredibleGroup): string => {
  * Converts one Accredible group ("badge template") into the shape Badge
  * Publisher's `badgeClassBasicSchema` (src/lib/utils/badges.ts) validates.
  *
- * IMPORTANT: alignment entries without a resolvable `targetUrl` are dropped
- * here rather than passed through with only `targetName`. Badge Publisher's
- * importer requires `targetUrl` to be a valid URL on every alignment entry
- * and rejects the *entire* achievement if even one entry is missing it, with
- * no special case for free-text skills. This was verified against a 316-item
- * sample produced by Accredible's export script: 255/316 (81%) failed import
- * for exactly this reason, across 799 total alignment entries, all missing
- * targetUrl. Dropping unresolvable entries lets the rest of the achievement
- * (name, description, criteria) still publish, at the cost of losing the
- * unresolved skill names -- which is a reasonable tradeoff since Badge
- * Publisher can't accept them as-is anyway.
+ * Alignments come primarily from the group's `skills[]` (populated on each
+ * group by fetchAccredibleGroups() via a per-group GET): each skill carries a
+ * public framework `url` -- the targetUrl Badge Publisher's importer requires.
+ * `learning_outcomes` is used only as a fallback for the rare structured-object
+ * form that already includes a targetUrl; its common bare-string form has no
+ * URL and is skipped.
+ *
+ * IMPORTANT: Badge Publisher requires a valid `targetUrl` on EVERY alignment
+ * entry and rejects the *entire* achievement if even one is missing it. So any
+ * entry without a resolvable targetUrl is dropped here (rather than passed
+ * through with only a name) to keep the rest of the achievement publishable.
+ * Reading `skills[]` instead of `learning_outcomes` is what makes this retain
+ * data: in a 316-item sample, 255 (81%) previously lost ALL skills because
+ * learning_outcomes never carries a URL.
  */
 export const badgeclassFromAccredibleGroup = (
 	g: AccredibleGroup,
@@ -172,7 +224,22 @@ export const badgeclassFromAccredibleGroup = (
 	const name = g.course_name || g.name || '';
 	const description = stripHtml(g.course_description || g.description || '');
 
-	const alignment: Alignment[] = (g.learning_outcomes || [])
+	const frameworkName = g.skill_framework?.name || g.skill_framework?.taxonomy;
+
+	// Primary source: framework-matched skills, each with a public URL.
+	const skillAlignments: Alignment[] = (g.skills || [])
+		.map((s): Partial<Alignment> => ({
+			targetName: s.name || '',
+			targetUrl: s.url,
+			targetDescription: stripHtml(s.description || ''),
+			targetFramework: frameworkName,
+			targetCode: s.identifier
+		}))
+		.filter((a): a is Alignment => !!a.targetUrl && !!a.targetName);
+
+	// Fallback: structured learning_outcomes that already carry a targetUrl
+	// (bare-string outcomes have none and are dropped by the filter).
+	const outcomeAlignments: Alignment[] = (g.learning_outcomes || [])
 		.map((o): Partial<Alignment> => {
 			if (typeof o === 'string') return { targetName: o };
 			return {
@@ -183,6 +250,13 @@ export const badgeclassFromAccredibleGroup = (
 			};
 		})
 		.filter((a): a is Alignment => !!a.targetUrl && !!a.targetName);
+
+	// Merge, de-duping by targetUrl (skills win).
+	const seenUrls = new Set(skillAlignments.map((a) => a.targetUrl));
+	const alignment: Alignment[] = [
+		...skillAlignments,
+		...outcomeAlignments.filter((a) => !seenUrls.has(a.targetUrl))
+	];
 
 	return {
 		id: `${env.credentialDomain}/group/${g.id}`,
@@ -207,10 +281,27 @@ export const accredibleAuthHeader = (apiKey: string) => ({
 	Value: `Token token=${apiKey}`
 });
 
-// A Design object as returned by GET /v1/designs/{design_id}. Only the
-// image-bearing fields are modeled here. `rasterized_content_url` is
-// Accredible's documented "link to generate an image of the design"; the other
-// keys are tolerated as fallbacks in case the account returns a different shape.
+// Endpoint for a single group's full detail. The list endpoint (all_groups)
+// omits earning_criteria, achievement_type, skills and skill_framework; this
+// GET returns them under a `group` envelope.
+export const accredibleGroupDetailEndpoint = (env: AccredibleEnv, groupId: string | number) =>
+	`${env.apiDomain}/v1/issuer/groups/${groupId}`;
+
+// Unwrap the single-group GET response ({ group: {...} }), tolerating a bare
+// object. Returns undefined when the payload has no usable group.
+export const groupFromDetailPayload = (payload: unknown): AccredibleGroup | undefined => {
+	if (!payload || typeof payload !== 'object') return undefined;
+	const root = payload as Record<string, any>;
+	const g = root.group ?? root;
+	return g && typeof g === 'object' && (g.id !== undefined || g.name || g.course_name)
+		? (g as AccredibleGroup)
+		: undefined;
+};
+
+// A Design object as (optionally) returned by GET /v1/designs/{design_id}. The
+// official spec does NOT document this response or a `rasterized_content_url`
+// field -- the documented image source is the /preview endpoint ({ link }). The
+// GET is kept only as a best-effort fallback, so these keys are speculative.
 export interface AccredibleDesign {
 	id?: number | string;
 	kind?: string; // 'badge' | 'certificate'
@@ -245,13 +336,14 @@ export const accredibleDesignEndpoint = (env: AccredibleEnv, designId: string | 
 export const accredibleDesignPreviewEndpoint = (env: AccredibleEnv, designId: string | number) =>
 	`${env.apiDomain}/v1/designs/${designId}/preview`;
 
-// Extract a usable image URL from a design or design-preview payload, tolerating
-// either a bare object or one wrapped under a `design` key, and a few field-name
-// variants (`rasterized_content_url` from GET design, `link` from the preview
-// endpoint). Returns '' when nothing usable is present.
+// Extract a usable image URL from a design-preview (or design) payload,
+// tolerating either a bare object or one wrapped under a `design` key. The
+// documented, primary source is the preview endpoint's `link`; the others are
+// tolerated fallbacks in case a given account's design GET returns them.
+// Returns '' when nothing usable is present.
 export const imageUrlFromDesign = (payload: unknown): string => {
 	const root = (payload ?? {}) as Record<string, any>;
 	const d: Record<string, any> = root.design ?? root;
-	const candidate = d.rasterized_content_url || d.image_url || d.preview_url || d.link;
+	const candidate = d.link || d.rasterized_content_url || d.image_url || d.preview_url;
 	return typeof candidate === 'string' ? candidate : '';
 };

@@ -9,15 +9,18 @@ import {
 import type { CredlyBadgeBasic, CredlyIssuerBasic } from '$lib/utils/credly.js';
 import { writable, derived, get, type Readable } from 'svelte/store';
 import { PUBLIC_UI_API_BASEURL } from '$env/static/public';
+import { env as publicDynamicEnv } from '$env/dynamic/public';
 import { publisherUser } from '$lib/stores/publisherStore.js';
 import { badgeclassFromParchmentApiBadge, type ParchmentBadge, type ParchmentEnvKey, type ParchmentIssuer, parchmentRegions } from '$lib/utils/parchment.js';
 import {
 	accredibleAuthHeader,
 	accredibleDesignEndpoint,
 	accredibleDesignPreviewEndpoint,
+	accredibleGroupDetailEndpoint,
 	accredibleRegions,
 	badgeclassFromAccredibleGroup,
 	badgeDesignIdForGroup,
+	groupFromDetailPayload,
 	imageUrlFromDesign,
 	type AccredibleEnvKey,
 	type AccredibleGroup
@@ -244,9 +247,8 @@ export const fetchAccredibleGroups = async (): Promise<boolean> => {
 		}
 
 		const body = JSON.parse(proxyResponseData.Data?.Body);
-		// NOTE: the exact envelope key returned by this endpoint was not confirmed
-		// against Accredible's API reference (unreachable while building this).
-		// Handle a few plausible shapes defensively; adjust once confirmed.
+		// Confirmed against openapi.json: the response is { groups: [...], meta }.
+		// The extra fallbacks are harmless defensiveness.
 		const pageGroups: AccredibleGroup[] = body.groups || body.all_groups || (Array.isArray(body) ? body : []);
 
 		allGroups = [...allGroups, ...pageGroups];
@@ -284,15 +286,42 @@ export const fetchAccredibleGroups = async (): Promise<boolean> => {
 		return null;
 	};
 
-	// The design's rasterized image is a BLANK template (no data merged), so to
-	// match how Accredible renders the badge we POST to the design /preview
-	// endpoint with the group's display name merged in (`group.course_name` /
-	// `group.name`), which returns a rendered `{ link }`. We fall back to the
-	// blank rasterized image only if the merged render fails. Because the merged
-	// image depends on the name, it's per-group; we cache by design+name since
-	// groups can share a design and name.
+	// OPT-IN per-group skill enrichment. `skills[]` (framework-matched skills with
+	// public URLs, the only alignments Badge Publisher can accept) is returned
+	// ONLY by the single-group GET /v1/issuer/groups/{id}, not the list -- but it
+	// is a pay-gated Accredible feature that most badges leave empty. Fetching it
+	// means one extra request per group, so it is off by default and enabled with
+	// PUBLIC_ACCREDIBLE_FETCH_GROUP_SKILLS="true". Note: earning_criteria and
+	// achievement_type already come back on the list endpoint, so skipping this
+	// does NOT lose them.
+	const fetchGroupSkills = publicDynamicEnv.PUBLIC_ACCREDIBLE_FETCH_GROUP_SKILLS === 'true';
+
+	// Badge image resolution (always on). The design's rasterized image is a BLANK
+	// template, so we POST to the design /preview endpoint with the group's display
+	// name merged in, which returns a rendered `{ link }` (the documented, primary
+	// image source), falling back to the blank design GET. Cached by design+name
+	// since groups can share a design and name.
 	const imageCache = new Map<string, string>();
 	for (const g of allGroups) {
+		// 1. (Opt-in) backfill skills/framework from the single-group GET.
+		if (fetchGroupSkills) {
+			try {
+				const detail = groupFromDetailPayload(
+					await proxyRequest('GET', accredibleGroupDetailEndpoint(env, g.id))
+				);
+				if (detail) {
+					g.earning_criteria = detail.earning_criteria ?? g.earning_criteria;
+					g.achievement_type = detail.achievement_type ?? g.achievement_type;
+					g.skills = detail.skills ?? g.skills;
+					g.skill_framework = detail.skill_framework ?? g.skill_framework;
+					g.learning_outcomes = detail.learning_outcomes ?? g.learning_outcomes;
+				}
+			} catch (e) {
+				console.warn(`Could not load Accredible group ${g.id} detail:`, e);
+			}
+		}
+
+		// 2. Resolve the badge image.
 		if (g.image_url) continue;
 		const designId = badgeDesignIdForGroup(g);
 		if (designId === undefined) continue;
